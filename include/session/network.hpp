@@ -122,6 +122,8 @@ struct onion_path {
 
     std::string to_string() const;
 
+    bool contains_node(const service_node& sn) const;
+
     bool operator==(const onion_path& other) const {
         // The `conn_info` and failure/timeout counts can be reset for a path in a number
         // of situations so just use the nodes to determine if the paths match
@@ -135,9 +137,6 @@ namespace detail {
             std::vector<service_node> nodes);
 
     std::optional<service_node> node_for_destination(onionreq::network_destination destination);
-
-    session::onionreq::x25519_pubkey pubkey_for_destination(
-            onionreq::network_destination destination);
 
 }  //  namespace detail
 
@@ -593,7 +592,7 @@ class Network {
     /// Outputs:
     /// - The possible path, if found.
     virtual std::optional<onion_path> find_valid_path(
-            const request_info info, const std::vector<onion_path> paths);
+            const request_info& info, const std::vector<onion_path>& paths);
 
     /// API: network/build_path_if_needed
     ///

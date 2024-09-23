@@ -214,7 +214,7 @@ class TestNetwork : public Network {
     }
 
     std::optional<onion_path> find_valid_path(
-            request_info info, std::vector<onion_path> paths) override {
+            const request_info& info, const std::vector<onion_path>& paths) override {
         const auto func_name = "find_valid_path";
 
         if (check_should_ignore_and_log_call(func_name))

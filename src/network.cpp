@@ -240,21 +240,6 @@ namespace {
     constexpr auto file_server_pubkey =
             "da21e1d886c6fbaea313f75298bd64aab03a97ce985b46bb2dad9f2089c8ee59"sv;
 
-    /// rng type that uses llarp::randint(), which is cryptographically secure
-    struct CSRNG {
-        using result_type = uint64_t;
-
-        static constexpr uint64_t min() { return std::numeric_limits<uint64_t>::min(); };
-
-        static constexpr uint64_t max() { return std::numeric_limits<uint64_t>::max(); };
-
-        uint64_t operator()() {
-            uint64_t i;
-            randombytes((uint8_t*)&i, sizeof(i));
-            return i;
-        };
-    };
-
     std::string node_to_disk(service_node node) {
         // Format is "{ip}|{port}|{version}|{ed_pubkey}|{swarm_id}"
         auto ed25519_pubkey_hex = oxenc::to_hex(node.view_remote_key());
@@ -328,16 +313,6 @@ namespace detail {
             return *dest;
 
         return std::nullopt;
-    }
-
-    session::onionreq::x25519_pubkey pubkey_for_destination(network_destination destination) {
-        if (auto* dest = std::get_if<service_node>(&destination))
-            return compute_xpk(dest->view_remote_key());
-
-        if (auto* dest = std::get_if<ServerDestination>(&destination))
-            return dest->x25519_pubkey;
-
-        throw std::runtime_error{"Invalid destination."};
     }
 
     nlohmann::json get_service_nodes_params(std::optional<int> limit) {
@@ -504,6 +479,15 @@ std::string onion_path::to_string() const {
             [](const service_node& node) { return node.to_string(); });
 
     return "{}"_format(fmt::join(node_descriptions, ", "));
+}
+
+bool onion_path::contains_node(const service_node& sn) const {
+    for (auto& n : nodes) {
+        if (n == sn)
+            return true;
+    }
+
+    return false;
 }
 
 // MARK: Initialization
@@ -845,8 +829,7 @@ std::vector<service_node> Network::get_unused_nodes() {
                 });
 
     // Shuffle the `result` so anything that uses it would get random nodes
-    CSRNG rng;
-    std::shuffle(result.begin(), result.end(), rng);
+    std::shuffle(result.begin(), result.end(), csrng);
 
     return result;
 }
@@ -1054,8 +1037,7 @@ void Network::establish_and_store_connection(std::string path_id) {
 
 void Network::refresh_snode_cache_complete(std::vector<service_node> nodes) {
     // Shuffle the nodes so we don't have a specific order
-    CSRNG rng;
-    std::shuffle(nodes.begin(), nodes.end(), rng);
+    std::shuffle(nodes.begin(), nodes.end(), csrng);
 
     // Update the disk cache if the snode pool was updated
     {
@@ -1128,9 +1110,8 @@ void Network::refresh_snode_cache_from_seed_nodes(std::string request_id, bool r
                 request_id);
 
         // Shuffle to ensure we pick random nodes to fetch from
-        CSRNG rng;
         unused_snode_refresh_nodes = (use_testnet ? seed_nodes_testnet : seed_nodes_mainnet);
-        std::shuffle(unused_snode_refresh_nodes->begin(), unused_snode_refresh_nodes->end(), rng);
+        std::shuffle(unused_snode_refresh_nodes->begin(), unused_snode_refresh_nodes->end(), csrng);
     }
 
     auto target_node = unused_snode_refresh_nodes->back();
@@ -1500,7 +1481,7 @@ void Network::build_path(std::string path_id, PathType path_type) {
 }
 
 std::optional<onion_path> Network::find_valid_path(
-        const request_info info, const std::vector<onion_path> paths) {
+        const request_info& info, const std::vector<onion_path>& paths) {
     if (paths.empty())
         return std::nullopt;
 
@@ -1515,16 +1496,12 @@ std::optional<onion_path> Network::find_valid_path(
     // the destination
     if (auto target = detail::node_for_destination(info.destination)) {
         std::vector<onion_path> ip_excluded_paths;
+
         std::copy_if(
                 possible_paths.begin(),
                 possible_paths.end(),
                 std::back_inserter(ip_excluded_paths),
-                [excluded_ip = target->to_ipv4()](const auto& path) {
-                    return std::none_of(
-                            path.nodes.begin(), path.nodes.end(), [&excluded_ip](const auto& node) {
-                                return node.to_ipv4() == excluded_ip;
-                            });
-                });
+                [&](const onion_path& p) { return not p.contains_node(*target); });
 
         if (single_path_mode && ip_excluded_paths.empty())
             log::warning(
@@ -1536,38 +1513,33 @@ std::optional<onion_path> Network::find_valid_path(
             possible_paths = ip_excluded_paths;
     }
 
-    if (possible_paths.empty())
+    auto n_paths = possible_paths.size();
+
+    if (not n_paths)
         return std::nullopt;
 
-    // Randomise the possible paths (if all paths are equal for the PathSelectionBehaviour then we
-    // want a random one to be selected)
-    CSRNG rng;
-    std::shuffle(possible_paths.begin(), possible_paths.end(), rng);
+    if (info.path_type == PathType::upload or info.path_type == PathType::download) {
+        size_t min_paths = single_path_mode ? 1 : 2;
+        auto max_pending = *std::max_element(
+                possible_paths.begin(),
+                possible_paths.end(),
+                [](const onion_path& lhs, const onion_path& rhs) {
+                    return lhs.num_pending_requests() < rhs.num_pending_requests();
+                });
 
-    // Select from the possible paths based on the desired behaviour
-    auto behaviour = path_selection_behaviour(info.path_type);
-    switch (behaviour) {
-        case PathSelectionBehaviour::new_or_least_busy: {
-            auto min_num_paths = min_path_count(info.path_type, single_path_mode);
-            std::sort(
-                    possible_paths.begin(), possible_paths.end(), [](const auto& a, const auto& b) {
-                        return a.num_pending_requests() < b.num_pending_requests();
-                    });
-
-            // If we have already have the min number of paths for this path type, or there is
-            // a path with no pending requests then return the first path
-            if (paths.size() >= min_num_paths || possible_paths.front().num_pending_requests() == 0)
-                return possible_paths.front();
-
+        // If we have already have the min number of paths for this path type, or there is
+        // a path with no pending requests then return the first path
+        if (paths.size() >= min_paths or max_pending.num_pending_requests() == 0)
+            return max_pending;
+        else {
             // Otherwise we want to build a new path (for this PathSelectionBehaviour the assuption
             // is that it'd be faster to build a new path and send the request along that rather
             // than use an existing path)
             return std::nullopt;
         }
-
-        // Random is the default behaviour
-        case PathSelectionBehaviour::random: return possible_paths.front();
-        default: return possible_paths.front();
+    } else {
+        // return random index without having to shuffle the entire vector
+        return possible_paths[csrng() % n_paths];
     }
 };
 
@@ -1890,202 +1862,198 @@ void Network::_send_onion_request(request_info info, network_response_callback_t
 
     // Try to retrieve a valid path for this request, if we can't get one then add the request to
     // the queue to be run once a path for it has successfully been built
-    auto path = net.call_get([this, info]() {
-        auto result = find_valid_path(info, paths[info.path_type]);
-        net.call_soon([this, path_type = info.path_type, found_path = result.has_value()]() {
-            build_path_if_needed(path_type, found_path);
-        });
-        return result;
-    });
+    if (auto maybe_path = find_valid_path(info, paths[info.path_type]); not maybe_path) {
+        auto& path = *maybe_path;
 
-    if (!path) {
-        return net.call([this, info = std::move(info), cb = std::move(handle_response)]() {
-            // If the network is suspended then fail immediately
-            if (suspended)
-                return cb(
-                        false,
-                        false,
-                        error_network_suspended,
-                        {content_type_plain_text},
-                        "Network is suspended.");
+        log::trace(cat, "{} got {} path for {}.", __PRETTY_FUNCTION__, path_name, info.request_id);
 
-            request_queue[info.path_type].emplace_back(std::move(info), std::move(cb));
+        auto builder = Builder::make(info.destination, path.nodes);
+        try {
+            builder.generate(info);
+        } catch (const std::exception& e) {
+            log::warning(cat, "Builder exception: {}", e.what());
+            return handle_response(
+                    false,
+                    false,
+                    error_building_onion_request,
+                    {content_type_plain_text},
+                    e.what());
+        }
 
-            // If the request has a path_build_timeout then start the timeout check loop
-            if (info.request_and_path_build_timeout)
-                net.call_later(queued_request_path_build_timeout_frequency, [this]() {
-                    check_request_queue_timeouts();
-                });
-        });
-    }
+        send_request(
+                info,
+                path.conn_info,
+                [this,
+                 builder = std::move(builder),
+                 info,
+                 path = std::move(path),
+                 cb = std::move(handle_response)](
+                        bool success,
+                        bool timeout,
+                        int16_t status_code,
+                        std::vector<std::pair<std::string, std::string>> headers,
+                        std::optional<std::string> response) mutable {
+                    log::trace(
+                            cat, "{} got response for {}.", __PRETTY_FUNCTION__, info.request_id);
 
-    log::trace(cat, "{} got {} path for {}.", __PRETTY_FUNCTION__, path_name, info.request_id);
+                    // If the request was reported as a failure or a timeout then we
+                    // will have already handled the errors so just trigger the callback
+                    if (!success || timeout)
+                        return cb(success, timeout, status_code, headers, response);
 
-    // Construct the onion request
-    auto builder = Builder();
-    try {
-        builder.set_destination(info.destination);
-        builder.set_destination_pubkey(detail::pubkey_for_destination(info.destination));
+                    try {
+                        // Ensure the response is long enough to be processed, if not
+                        // then handle it as an error
+                        if (!ResponseParser::response_long_enough(
+                                    builder.enc_type, response->size()))
+                            throw status_code_exception{
+                                    status_code,
+                                    {content_type_plain_text},
+                                    "Response is too short to be an onion request response: " +
+                                            *response};
 
-        for (auto& node : path->nodes)
-            builder.add_hop(
-                    {ed25519_pubkey::from_bytes(node.view_remote_key()),
-                     compute_xpk(node.view_remote_key())});
+                        // Otherwise, process the onion request response
+                        std::tuple<
+                                int16_t,
+                                std::vector<std::pair<std::string, std::string>>,
+                                std::optional<std::string>>
+                                processed_response;
 
-        // Update the `request_info` to have the onion request payload
-        auto payload = builder.generate_payload(info.original_body);
-        info.body = builder.build(payload);
-    } catch (const std::exception& e) {
-        return handle_response(
-                false, false, error_building_onion_request, {content_type_plain_text}, e.what());
-    }
+                        // The SnodeDestination runs via V3 onion requests and the
+                        // ServerDestination runs via V4
+                        if (std::holds_alternative<service_node>(info.destination))
+                            processed_response = process_v3_onion_response(builder, *response);
+                        else if (std::holds_alternative<ServerDestination>(info.destination))
+                            processed_response = process_v4_onion_response(builder, *response);
 
-    // Actually send the request
-    send_request(
-            info,
-            path->conn_info,
-            [this,
-             builder = std::move(builder),
-             info,
-             path = *path,
-             cb = std::move(handle_response)](
-                    bool success,
-                    bool timeout,
-                    int16_t status_code,
-                    std::vector<std::pair<std::string, std::string>> headers,
-                    std::optional<std::string> response) {
-                log::trace(cat, "{} got response for {}.", __PRETTY_FUNCTION__, info.request_id);
+                        // If we got a non 2xx status code, return the error
+                        auto& [processed_status_code, processed_headers, processed_body] =
+                                processed_response;
+                        if (processed_status_code < 200 || processed_status_code > 299)
+                            throw status_code_exception{
+                                    processed_status_code,
+                                    {content_type_plain_text},
+                                    processed_body.value_or("Request returned "
+                                                            "non-success status "
+                                                            "code.")};
 
-                // If the request was reported as a failure or a timeout then we
-                // will have already handled the errors so just trigger the callback
-                if (!success || timeout)
-                    return cb(success, timeout, status_code, headers, response);
+                        // For debugging purposes we want to add a log if this was a successful
+                        // request after we did an automatic retry
+                        detail::log_retry_result_if_needed(info, single_path_mode);
 
-                try {
-                    // Ensure the response is long enough to be processed, if not
-                    // then handle it as an error
-                    if (!ResponseParser::response_long_enough(builder.enc_type, response->size()))
-                        throw status_code_exception{
-                                status_code,
-                                {content_type_plain_text},
-                                "Response is too short to be an onion request response: " +
-                                        *response};
+                        // Try process the body in case it was a batch request which
+                        // failed
+                        std::optional<nlohmann::json> results;
+                        if (processed_body) {
+                            try {
+                                auto processed_body_json = nlohmann::json::parse(*processed_body);
 
-                    // Otherwise, process the onion request response
-                    std::tuple<
-                            int16_t,
-                            std::vector<std::pair<std::string, std::string>>,
-                            std::optional<std::string>>
-                            processed_response;
-
-                    // The SnodeDestination runs via V3 onion requests and the
-                    // ServerDestination runs via V4
-                    if (std::holds_alternative<service_node>(info.destination))
-                        processed_response = process_v3_onion_response(builder, *response);
-                    else if (std::holds_alternative<ServerDestination>(info.destination))
-                        processed_response = process_v4_onion_response(builder, *response);
-
-                    // If we got a non 2xx status code, return the error
-                    auto& [processed_status_code, processed_headers, processed_body] =
-                            processed_response;
-                    if (processed_status_code < 200 || processed_status_code > 299)
-                        throw status_code_exception{
-                                processed_status_code,
-                                {content_type_plain_text},
-                                processed_body.value_or("Request returned "
-                                                        "non-success status "
-                                                        "code.")};
-
-                    // For debugging purposes we want to add a log if this was a successful request
-                    // after we did an automatic retry
-                    detail::log_retry_result_if_needed(info, single_path_mode);
-
-                    // Try process the body in case it was a batch request which
-                    // failed
-                    std::optional<nlohmann::json> results;
-                    if (processed_body) {
-                        try {
-                            auto processed_body_json = nlohmann::json::parse(*processed_body);
-
-                            // If it wasn't a batch/sequence request then assume it
-                            // was successful and return no error
-                            if (processed_body_json.contains("results"))
-                                results = processed_body_json["results"];
-                        } catch (...) {
+                                // If it wasn't a batch/sequence request then assume it
+                                // was successful and return no error
+                                if (processed_body_json.contains("results"))
+                                    results = processed_body_json["results"];
+                            } catch (...) {
+                            }
                         }
-                    }
 
-                    // If there was no 'results' array then it wasn't a batch
-                    // request so we can stop here and return
-                    if (!results)
+                        // If there was no 'results' array then it wasn't a batch
+                        // request so we can stop here and return
+                        if (!results)
+                            return cb(
+                                    true,
+                                    false,
+                                    processed_status_code,
+                                    processed_headers,
+                                    processed_body);
+
+                        // Otherwise we want to check if all of the results have the
+                        // same status code and, if so, handle that failure case
+                        // (default the 'error_body' to the 'processed_body' in case we
+                        // don't get an explicit error)
+                        int16_t single_status_code = -1;
+                        std::vector<std::pair<std::string, std::string>> single_headers = {
+                                content_type_plain_text};
+                        std::optional<std::string> error_body = processed_body;
+                        for (const auto& result : results->items()) {
+                            if (result.value().contains("code") &&
+                                result.value()["code"].is_number() &&
+                                (single_status_code == -1 ||
+                                 result.value()["code"].get<int16_t>() != single_status_code))
+                                single_status_code = result.value()["code"].get<int16_t>();
+                            else {
+                                // Either there was no code, or the code was different
+                                // from a former code in which case there wasn't an
+                                // individual detectable error (ie. it needs specific
+                                // handling) so return no error
+                                single_status_code = 200;
+                                break;
+                            }
+
+                            if (result.value().contains("headers")) {
+                                single_headers = {};
+                                auto header_vals = result.value()["headers"];
+
+                                for (auto it = header_vals.begin(); it != header_vals.end(); ++it)
+                                    single_headers.emplace_back(it.key(), it.value());
+                            }
+
+                            if (result.value().contains("body") &&
+                                result.value()["body"].is_string())
+                                error_body = result.value()["body"].get<std::string>();
+                        }
+
+                        // If all results contained the same error then handle it as a
+                        // single error
+                        if (single_status_code < 200 || single_status_code > 299)
+                            throw status_code_exception{
+                                    single_status_code,
+                                    single_headers,
+                                    error_body.value_or("Sub-request returned "
+                                                        "non-success status code.")};
+
+                        // Otherwise some requests succeeded and others failed so
+                        // succeed with the processed data
                         return cb(
                                 true,
                                 false,
                                 processed_status_code,
                                 processed_headers,
                                 processed_body);
-
-                    // Otherwise we want to check if all of the results have the
-                    // same status code and, if so, handle that failure case
-                    // (default the 'error_body' to the 'processed_body' in case we
-                    // don't get an explicit error)
-                    int16_t single_status_code = -1;
-                    std::vector<std::pair<std::string, std::string>> single_headers = {
-                            content_type_plain_text};
-                    std::optional<std::string> error_body = processed_body;
-                    for (const auto& result : results->items()) {
-                        if (result.value().contains("code") && result.value()["code"].is_number() &&
-                            (single_status_code == -1 ||
-                             result.value()["code"].get<int16_t>() != single_status_code))
-                            single_status_code = result.value()["code"].get<int16_t>();
-                        else {
-                            // Either there was no code, or the code was different
-                            // from a former code in which case there wasn't an
-                            // individual detectable error (ie. it needs specific
-                            // handling) so return no error
-                            single_status_code = 200;
-                            break;
-                        }
-
-                        if (result.value().contains("headers")) {
-                            single_headers = {};
-                            auto header_vals = result.value()["headers"];
-
-                            for (auto it = header_vals.begin(); it != header_vals.end(); ++it)
-                                single_headers.emplace_back(it.key(), it.value());
-                        }
-
-                        if (result.value().contains("body") && result.value()["body"].is_string())
-                            error_body = result.value()["body"].get<std::string>();
+                    } catch (const status_code_exception& e) {
+                        handle_errors(
+                                info,
+                                path.conn_info,
+                                false,
+                                e.status_code,
+                                e.headers,
+                                e.what(),
+                                cb);
+                    } catch (const std::exception& e) {
+                        handle_errors(
+                                info,
+                                path.conn_info,
+                                false,
+                                -1,
+                                {content_type_plain_text},
+                                e.what(),
+                                cb);
                     }
+                });
+    } else if (suspended)
+        return handle_response(
+                false,
+                false,
+                error_network_suspended,
+                {content_type_plain_text},
+                "Network is suspended.");
 
-                    // If all results contained the same error then handle it as a
-                    // single error
-                    if (single_status_code < 200 || single_status_code > 299)
-                        throw status_code_exception{
-                                single_status_code,
-                                single_headers,
-                                error_body.value_or("Sub-request returned "
-                                                    "non-success status code.")};
+    request_queue[info.path_type].emplace_back(std::move(info), std::move(handle_response));
 
-                    // Otherwise some requests succeeded and others failed so
-                    // succeed with the processed data
-                    return cb(
-                            true, false, processed_status_code, processed_headers, processed_body);
-                } catch (const status_code_exception& e) {
-                    handle_errors(
-                            info, path.conn_info, false, e.status_code, e.headers, e.what(), cb);
-                } catch (const std::exception& e) {
-                    handle_errors(
-                            info,
-                            path.conn_info,
-                            false,
-                            -1,
-                            {content_type_plain_text},
-                            e.what(),
-                            cb);
-                }
-            });
+    // If the request has a path_build_timeout then start the timeout check loop
+    if (info.request_and_path_build_timeout)
+        net.call_later(queued_request_path_build_timeout_frequency, [this]() {
+            check_request_queue_timeouts();
+        });
 }
 
 void Network::upload_file_to_server(
@@ -2521,14 +2489,13 @@ void Network::handle_errors(
                             throw std::invalid_argument{
                                     "Unable to handle redirect due to lack of swarm."};
 
-                        CSRNG rng;
                         std::vector<service_node> swarm_copy;
                         std::copy_if(
                                 cached_swarm.second.begin(),
                                 cached_swarm.second.end(),
                                 std::back_inserter(swarm_copy),
                                 [&target = *target](const auto& node) { return node != target; });
-                        std::shuffle(swarm_copy.begin(), swarm_copy.end(), rng);
+                        std::shuffle(swarm_copy.begin(), swarm_copy.end(), csrng);
 
                         if (swarm_copy.empty())
                             throw std::invalid_argument{"No other nodes in the swarm."};
@@ -2578,7 +2545,6 @@ void Network::handle_errors(
                                         auto target =
                                                 detail::node_for_destination(info.destination);
 
-                                        CSRNG rng;
                                         std::vector<service_node> swarm_copy;
                                         std::copy_if(
                                                 swarm.begin(),
@@ -2587,7 +2553,7 @@ void Network::handle_errors(
                                                 [&target = *target](const auto& node) {
                                                     return node != target;
                                                 });
-                                        std::shuffle(swarm_copy.begin(), swarm_copy.end(), rng);
+                                        std::shuffle(swarm_copy.begin(), swarm_copy.end(), csrng);
 
                                         // If there are no nodes in the swarm then don't bother
                                         // trying again

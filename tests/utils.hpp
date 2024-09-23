@@ -124,31 +124,31 @@ bool always_impl(std::chrono::milliseconds duration, Call&& f, Validator&& isVal
 }
 
 template <std::invocable Call>
-    requires std::is_same_v<std::invoke_result_t<Call>, bool>
-bool eventually_impl(std::chrono::milliseconds timeout, Call&& f) {
+    requires std::is_same_v<std::invoke_result_t<Call>, bool> bool
+eventually_impl(std::chrono::milliseconds timeout, Call&& f) {
     return eventually_impl(timeout, f, [](bool result) { return result; });
 }
 
 template <std::invocable Call>
     requires std::is_same_v<
-            std::invoke_result_t<Call>,
-            std::vector<typename std::invoke_result_t<Call>::value_type>>
+                     std::invoke_result_t<Call>,
+                     std::vector<typename std::invoke_result_t<Call>::value_type>>
 auto eventually_impl(std::chrono::milliseconds timeout, Call&& f) -> std::invoke_result_t<Call> {
     using ResultType = std::invoke_result_t<Call>;
     return eventually_impl(timeout, f, [](const ResultType& result) { return !result.empty(); });
 }
 
 template <std::invocable Call>
-    requires std::is_same_v<std::invoke_result_t<Call>, bool>
-bool always_impl(std::chrono::milliseconds duration, Call&& f) {
+    requires std::is_same_v<std::invoke_result_t<Call>, bool> bool
+always_impl(std::chrono::milliseconds duration, Call&& f) {
     return always_impl(duration, f, [](bool result) { return result; });
 }
 
 template <std::invocable Call>
     requires std::is_same_v<
             std::invoke_result_t<Call>,
-            std::vector<typename std::invoke_result_t<Call>::value_type>>
-bool always_impl(std::chrono::milliseconds duration, Call&& f) {
+            std::vector<typename std::invoke_result_t<Call>::value_type>> bool
+always_impl(std::chrono::milliseconds duration, Call&& f) {
     using ResultType = std::invoke_result_t<Call>;
     return always_impl(duration, f, [](const ResultType& result) { return !result.empty(); });
 }
